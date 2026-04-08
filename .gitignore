@@ -7,8 +7,8 @@ __pycache__/
 .venv/
 
 # Sensitive data and local datasets
-data/
-data/**
+/data/
+/data/**
 *.npz
 *.npy
 *.csv
