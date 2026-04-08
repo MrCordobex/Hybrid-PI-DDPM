@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
-from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
+from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records
 from tfm_shells.models.factory import build_scheduler, build_unet, count_parameters
 from tfm_shells.training.common import (
     architect_target,
@@ -37,10 +37,11 @@ from tfm_shells.utils.tracking import ExperimentTracker
 def _sample_images(
     model: torch.nn.Module,
     scheduler,
-    fz_cond: torch.Tensor,
+    batch_size: int,
+    height: int,
+    width: int,
     device: torch.device,
     num_steps: int,
-    include_fz_channel: bool,
 ) -> torch.Tensor:
     model.eval()
     inference_scheduler = build_scheduler(
@@ -51,12 +52,11 @@ def _sample_images(
     )
     inference_scheduler.set_timesteps(num_steps, device=device)
 
-    samples = torch.randn((fz_cond.shape[0], 1, fz_cond.shape[-2], fz_cond.shape[-1]), device=device)
+    samples = torch.randn((batch_size, 1, height, width), device=device)
     with torch.no_grad():
         for timestep in inference_scheduler.timesteps:
             t_batch = torch.full((samples.shape[0],), int(timestep.item()), device=device, dtype=torch.long)
-            model_input = torch.cat([samples, fz_cond], dim=1) if include_fz_channel else samples
-            model_output = model(model_input, t_batch).sample
+            model_output = model(samples, t_batch).sample
             samples = inference_scheduler.step(model_output, timestep, samples).prev_sample
     return samples
 
@@ -95,7 +95,6 @@ def _run_epoch(
     device: torch.device,
     mixed_precision: bool,
     grad_clip_norm: float,
-    include_fz_channel: bool,
     epoch: int,
     total_epochs: int,
     phase: str,
@@ -115,7 +114,6 @@ def _run_epoch(
         progress = tqdm(loader, leave=False, desc=f"{phase} {epoch:03d}/{total_epochs:03d}")
         for batch in progress:
             z_clean = batch["z"].to(device, non_blocking=True)
-            fz_cond = batch["fz_norm"].to(device, non_blocking=True)
             batch_size = z_clean.shape[0]
 
             noise = torch.randn_like(z_clean)
@@ -133,8 +131,7 @@ def _run_epoch(
                 optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-                model_input = torch.cat([z_noisy, fz_cond], dim=1) if include_fz_channel else z_noisy
-                prediction = model(model_input, timesteps).sample
+                prediction = model(z_noisy, timesteps).sample
                 loss = F.mse_loss(prediction, target)
 
             if is_train:
@@ -164,38 +161,24 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         subset=str(config["data"]["subset"]),
         min_mf_mean=config["data"].get("min_mf_mean"),
     )
-    train_records, val_records = split_records(
-        filtered,
-        val_ratio=float(config["data"]["val_ratio"]),
-        seed=int(config["seed"]),
-    )
 
-    stats = compute_normalization_stats(train_records, include_physics=False)
+    stats = compute_normalization_stats(filtered, include_physics=False)
     splits = {
-        "train": [record["name"] for record in train_records],
-        "val": [record["name"] for record in val_records],
+        "train": [record["name"] for record in filtered],
+        "val": [],
         "dataset_summary": {
             "all_filtered": dataset_summary(filtered),
-            "train": dataset_summary(train_records),
-            "val": dataset_summary(val_records),
+            "train": dataset_summary(filtered),
         },
     }
     save_run_metadata(config, directories, stats, splits)
 
-    train_dataset = ShellDataset(train_records, stats=stats, include_physics=False)
-    val_dataset = ShellDataset(val_records, stats=stats, include_physics=False)
+    train_dataset = ShellDataset(filtered, stats=stats, include_physics=False)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(config["data"]["batch_size"]),
         shuffle=True,
-        num_workers=int(config["data"]["num_workers"]),
-        pin_memory=bool(config["data"]["pin_memory"]),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=int(config["data"]["batch_size"]),
-        shuffle=False,
         num_workers=int(config["data"]["num_workers"]),
         pin_memory=bool(config["data"]["pin_memory"]),
     )
@@ -217,8 +200,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
     )
 
     history_rows: list[dict[str, Any]] = []
-    best_val_loss = float("inf")
-    epochs_without_improvement = 0
+    best_train_loss = float("inf")
     best_path = directories["model_root"] / "best.pt"
     last_path = directories["model_root"] / "last.pt"
     total_epochs = int(config["training"]["epochs"])
@@ -233,12 +215,11 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         print(f"dataset: {dataset_dir}")
         print(
             f"records: filtered={summary_filtered['count']} "
-            f"train={len(train_records)} val={len(val_records)} "
+            f"train={len(filtered)} "
             f"subsets={summary_filtered['subset_counts']}"
         )
         print(
             f"normalization: z=[{format_metric(float(stats['z_min']))}, {format_metric(float(stats['z_max']))}] "
-            f"fz=[{format_metric(float(stats['fz_min']))}, {format_metric(float(stats['fz_max']))}]"
         )
         print(f"model_parameters: {model_parameters:,}")
         print(f"artifacts: {directories['run_root']}")
@@ -253,8 +234,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         tracker.log_metrics(
             {
                 "dataset_count_filtered": float(len(filtered)),
-                "dataset_count_train": float(len(train_records)),
-                "dataset_count_val": float(len(val_records)),
+                "dataset_count_train": float(len(filtered)),
                 "mf_mean_filtered": float(splits["dataset_summary"]["all_filtered"]["mf_mean"]),
                 "model_parameters": float(model_parameters),
             }
@@ -269,31 +249,16 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 device=device,
                 mixed_precision=bool(config["training"]["mixed_precision"]),
                 grad_clip_norm=float(config["training"]["grad_clip_norm"]),
-                include_fz_channel=bool(config["data"]["include_fz_channel"]),
                 epoch=epoch,
                 total_epochs=total_epochs,
                 phase="train",
             )
-            val_metrics = _run_epoch(
-                model=model,
-                loader=val_loader,
-                scheduler=scheduler,
-                optimizer=None,
-                device=device,
-                mixed_precision=bool(config["training"]["mixed_precision"]),
-                grad_clip_norm=float(config["training"]["grad_clip_norm"]),
-                include_fz_channel=bool(config["data"]["include_fz_channel"]),
-                epoch=epoch,
-                total_epochs=total_epochs,
-                phase="val",
-            )
-            lr_scheduler.step(val_metrics["loss"])
+            lr_scheduler.step(train_metrics["loss"])
             current_lr = float(optimizer.param_groups[0]["lr"])
 
             row = {
                 "epoch": epoch,
                 "train_loss": train_metrics["loss"],
-                "val_loss": val_metrics["loss"],
                 "learning_rate": current_lr,
             }
             history_rows.append(row)
@@ -312,14 +277,12 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
             }
             torch.save(checkpoint, last_path)
 
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                epochs_without_improvement = 0
+            if train_metrics["loss"] < best_train_loss:
+                best_train_loss = train_metrics["loss"]
                 torch.save(checkpoint, best_path)
-                tracker.log_metrics({"best_val_loss": best_val_loss}, step=epoch)
+                tracker.log_metrics({"best_train_loss": best_train_loss}, step=epoch)
                 best_marker = " [best]"
             else:
-                epochs_without_improvement += 1
                 best_marker = ""
 
             tqdm.write(
@@ -327,40 +290,33 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                     [
                         f"epoch {epoch:03d}/{total_epochs:03d}",
                         f"train_loss={format_metric(train_metrics['loss'])}",
-                        f"val_loss={format_metric(val_metrics['loss'])}",
-                        f"best_val={format_metric(best_val_loss)}{best_marker}",
+                        f"best_train={format_metric(best_train_loss)}{best_marker}",
                         f"lr={format_metric(current_lr)}",
-                        f"patience={epochs_without_improvement}/{int(config['training']['early_stopping_patience'])}",
                     ]
                 )
             )
 
             sample_every = int(config["training"]["sample_every_n_epochs"])
             if epoch == 1 or epoch % sample_every == 0:
-                sample_batch = next(iter(val_loader))
-                fz_cond = sample_batch["fz_norm"][: int(config["training"]["sample_batch_size"])].to(device)
                 samples = _sample_images(
                     model=model,
                     scheduler=scheduler,
-                    fz_cond=fz_cond,
+                    batch_size=int(config["training"]["sample_batch_size"]),
+                    height=int(config["model"]["sample_size"]),
+                    width=int(config["model"]["sample_size"]),
                     device=device,
                     num_steps=int(config["training"]["sample_inference_steps"]),
-                    include_fz_channel=bool(config["data"]["include_fz_channel"]),
                 )
                 sample_path = directories["run_root"] / f"samples_epoch_{epoch:03d}.png"
                 _save_sample_grid(samples, stats, sample_path)
                 tracker.log_artifact(sample_path, artifact_path="samples")
                 tqdm.write(f"saved_samples: {sample_path}")
 
-            if epochs_without_improvement >= int(config["training"]["early_stopping_patience"]):
-                tqdm.write("early_stopping_triggered")
-                break
-
         save_history(history_rows, directories)
         curves_path = directories["run_root"] / "architect_curves.png"
         plot_training_curves(
             history_rows=history_rows,
-            metrics=[("train_loss", "val_loss")],
+            metrics=[("train_loss", None)],
             title="Architect training curves",
             output_path=curves_path,
         )
@@ -370,7 +326,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         tracker.log_artifact(last_path, artifact_path="checkpoints")
 
         summary = {
-            "best_val_loss": best_val_loss,
+            "best_train_loss": best_train_loss,
             "epochs_completed": len(history_rows),
             "run_id": tracker.run_id,
             "best_checkpoint": str(best_path),
@@ -380,13 +336,13 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         save_json(summary, directories["model_root"] / "summary.json")
         tracker.log_artifact(directories["run_root"] / "summary.json", artifact_path="run")
         print(
-            f"architect_finished | epochs={len(history_rows)} | best_val={format_metric(best_val_loss)} "
+            f"architect_finished | epochs={len(history_rows)} | best_train={format_metric(best_train_loss)} "
             f"| best_ckpt={best_path}"
         )
 
     finalize_latest_symlink(directories["latest_root"], directories["model_root"])
     return {
-        "best_val_loss": best_val_loss,
+        "best_train_loss": best_train_loss,
         "best_checkpoint": str(best_path),
         "last_checkpoint": str(last_path),
     }

@@ -83,7 +83,7 @@ def save_history(history_rows: list[dict[str, Any]], directories: dict[str, Path
 
 def plot_training_curves(
     history_rows: list[dict[str, Any]],
-    metrics: list[tuple[str, str]],
+    metrics: list[tuple[str, str | None]],
     title: str,
     output_path: Path,
 ) -> None:
@@ -97,9 +97,10 @@ def plot_training_curves(
 
     for axis, (train_key, val_key) in zip(axes, metrics):
         axis.plot(epochs, [row[train_key] for row in history_rows], label=train_key)
-        axis.plot(epochs, [row[val_key] for row in history_rows], label=val_key)
+        if val_key is not None:
+            axis.plot(epochs, [row[val_key] for row in history_rows], label=val_key)
         axis.set_xlabel("epoch")
-        axis.set_title(f"{train_key} vs {val_key}")
+        axis.set_title(train_key if val_key is None else f"{train_key} vs {val_key}")
         axis.grid(alpha=0.3)
         axis.legend()
 

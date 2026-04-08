@@ -95,12 +95,10 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
 
     arch_stats = architect_ckpt["normalization_stats"]
     eng_stats = engineer_ckpt["normalization_stats"]
-    fz_norm_arch = _normalize_minmax(fz_real, float(arch_stats["fz_min"]), float(arch_stats["fz_max"]))
     fz_norm_eng = _normalize_minmax(fz_real, float(eng_stats["fz_min"]), float(eng_stats["fz_max"]))
-    fz_cond_arch = torch.from_numpy(fz_norm_arch).unsqueeze(0).repeat(int(config["conditioning"]["batch_size"]), 1, 1, 1).to(device)
     fz_cond_eng = torch.from_numpy(fz_norm_eng).unsqueeze(0).repeat(int(config["conditioning"]["batch_size"]), 1, 1, 1).to(device)
 
-    x = torch.randn((fz_cond_arch.shape[0], 1, 64, 64), device=device)
+    x = torch.randn((int(config["conditioning"]["batch_size"]), 1, 64, 64), device=device)
     history = {"t": [], "objective": [], "mf_mean": [], "grad_norm": [], "guide_weight": []}
 
     p_mean = torch.tensor(eng_stats["physics_mean"], dtype=torch.float32, device=device).unsqueeze(0)
@@ -111,8 +109,7 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
         t_batch = torch.full((x.shape[0],), t_value, device=device, dtype=torch.long)
 
         with torch.no_grad():
-            architect_input = torch.cat([x, fz_cond_arch], dim=1) if int(architect_ckpt["model_config"]["in_channels"]) > 1 else x
-            model_output = architect(architect_input, t_batch).sample
+            model_output = architect(x, t_batch).sample
 
         x_req = x.detach().clone().requires_grad_(True)
         x_req_eng = _renormalize_tensor(
