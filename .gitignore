@@ -20,7 +20,7 @@ __pycache__/
 
 # Training outputs
 artifacts/
-models/
+/models/
 mlruns/
 
 # OS / editors
@@ -36,3 +36,8 @@ Thumbs.db
 *.crt
 *.p12
 *.secrets
+
+# Always keep source code under src/
+!/src/
+!/src/**/
+!/src/**/*.py
