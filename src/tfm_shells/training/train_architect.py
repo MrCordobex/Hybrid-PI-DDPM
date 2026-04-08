@@ -3,6 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from tfm_shells.utils.matplotlib_backend import configure_matplotlib_backend
+
+configure_matplotlib_backend()
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

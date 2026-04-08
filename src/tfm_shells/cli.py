@@ -4,10 +4,6 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
-from tfm_shells.sampling.guided import run_guided_sampling
-from tfm_shells.training.train_architect import train_architect
-from tfm_shells.training.train_engineer import train_engineer
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="TFM shell research CLI")
@@ -30,12 +26,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "architect":
+        from tfm_shells.training.train_architect import train_architect
+
         train_architect(Path(args.config))
         return
     if args.command == "engineer":
+        from tfm_shells.training.train_engineer import train_engineer
+
         train_engineer(Path(args.config))
         return
     if args.command == "sample":
+        from tfm_shells.sampling.guided import run_guided_sampling
+
         run_guided_sampling(Path(args.config))
         return
     raise ValueError(f"Unsupported command: {args.command}")
