@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 from tfm_shells.config import load_config, resolve_project_path
 from tfm_shells.data.dataset import ShellDataset, compute_normalization_stats
-from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records
+from tfm_shells.data.index import build_dataset_index, dataset_summary, filter_records, split_records
 from tfm_shells.models.factory import build_scheduler, build_unet, count_parameters
 from tfm_shells.training.common import (
     architect_target,
@@ -161,24 +161,38 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         subset=str(config["data"]["subset"]),
         min_mf_mean=config["data"].get("min_mf_mean"),
     )
+    train_records, val_records = split_records(
+        filtered,
+        val_ratio=float(config["data"]["val_ratio"]),
+        seed=int(config["seed"]),
+    )
 
-    stats = compute_normalization_stats(filtered, include_physics=False)
+    stats = compute_normalization_stats(train_records, include_physics=False)
     splits = {
-        "train": [record["name"] for record in filtered],
-        "val": [],
+        "train": [record["name"] for record in train_records],
+        "val": [record["name"] for record in val_records],
         "dataset_summary": {
             "all_filtered": dataset_summary(filtered),
-            "train": dataset_summary(filtered),
+            "train": dataset_summary(train_records),
+            "val": dataset_summary(val_records),
         },
     }
     save_run_metadata(config, directories, stats, splits)
 
-    train_dataset = ShellDataset(filtered, stats=stats, include_physics=False)
+    train_dataset = ShellDataset(train_records, stats=stats, include_physics=False)
+    val_dataset = ShellDataset(val_records, stats=stats, include_physics=False)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(config["data"]["batch_size"]),
         shuffle=True,
+        num_workers=int(config["data"]["num_workers"]),
+        pin_memory=bool(config["data"]["pin_memory"]),
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=int(config["data"]["batch_size"]),
+        shuffle=False,
         num_workers=int(config["data"]["num_workers"]),
         pin_memory=bool(config["data"]["pin_memory"]),
     )
@@ -200,7 +214,8 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
     )
 
     history_rows: list[dict[str, Any]] = []
-    best_train_loss = float("inf")
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
     best_path = directories["model_root"] / "best.pt"
     last_path = directories["model_root"] / "last.pt"
     total_epochs = int(config["training"]["epochs"])
@@ -215,7 +230,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         print(f"dataset: {dataset_dir}")
         print(
             f"records: filtered={summary_filtered['count']} "
-            f"train={len(filtered)} "
+            f"train={len(train_records)} val={len(val_records)} "
             f"subsets={summary_filtered['subset_counts']}"
         )
         print(
@@ -234,7 +249,8 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         tracker.log_metrics(
             {
                 "dataset_count_filtered": float(len(filtered)),
-                "dataset_count_train": float(len(filtered)),
+                "dataset_count_train": float(len(train_records)),
+                "dataset_count_val": float(len(val_records)),
                 "mf_mean_filtered": float(splits["dataset_summary"]["all_filtered"]["mf_mean"]),
                 "model_parameters": float(model_parameters),
             }
@@ -253,12 +269,25 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 total_epochs=total_epochs,
                 phase="train",
             )
-            lr_scheduler.step(train_metrics["loss"])
+            val_metrics = _run_epoch(
+                model=model,
+                loader=val_loader,
+                scheduler=scheduler,
+                optimizer=None,
+                device=device,
+                mixed_precision=bool(config["training"]["mixed_precision"]),
+                grad_clip_norm=float(config["training"]["grad_clip_norm"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="val",
+            )
+            lr_scheduler.step(val_metrics["loss"])
             current_lr = float(optimizer.param_groups[0]["lr"])
 
             row = {
                 "epoch": epoch,
                 "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
                 "learning_rate": current_lr,
             }
             history_rows.append(row)
@@ -277,12 +306,14 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
             }
             torch.save(checkpoint, last_path)
 
-            if train_metrics["loss"] < best_train_loss:
-                best_train_loss = train_metrics["loss"]
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                epochs_without_improvement = 0
                 torch.save(checkpoint, best_path)
-                tracker.log_metrics({"best_train_loss": best_train_loss}, step=epoch)
+                tracker.log_metrics({"best_val_loss": best_val_loss}, step=epoch)
                 best_marker = " [best]"
             else:
+                epochs_without_improvement += 1
                 best_marker = ""
 
             tqdm.write(
@@ -290,8 +321,10 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                     [
                         f"epoch {epoch:03d}/{total_epochs:03d}",
                         f"train_loss={format_metric(train_metrics['loss'])}",
-                        f"best_train={format_metric(best_train_loss)}{best_marker}",
+                        f"val_loss={format_metric(val_metrics['loss'])}",
+                        f"best_val={format_metric(best_val_loss)}{best_marker}",
                         f"lr={format_metric(current_lr)}",
+                        f"patience={epochs_without_improvement}/{int(config['training']['early_stopping_patience'])}",
                     ]
                 )
             )
@@ -312,11 +345,15 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 tracker.log_artifact(sample_path, artifact_path="samples")
                 tqdm.write(f"saved_samples: {sample_path}")
 
+            if epochs_without_improvement >= int(config["training"]["early_stopping_patience"]):
+                tqdm.write("early_stopping_triggered")
+                break
+
         save_history(history_rows, directories)
         curves_path = directories["run_root"] / "architect_curves.png"
         plot_training_curves(
             history_rows=history_rows,
-            metrics=[("train_loss", None)],
+            metrics=[("train_loss", "val_loss")],
             title="Architect training curves",
             output_path=curves_path,
         )
@@ -326,7 +363,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         tracker.log_artifact(last_path, artifact_path="checkpoints")
 
         summary = {
-            "best_train_loss": best_train_loss,
+            "best_val_loss": best_val_loss,
             "epochs_completed": len(history_rows),
             "run_id": tracker.run_id,
             "best_checkpoint": str(best_path),
@@ -336,13 +373,13 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         save_json(summary, directories["model_root"] / "summary.json")
         tracker.log_artifact(directories["run_root"] / "summary.json", artifact_path="run")
         print(
-            f"architect_finished | epochs={len(history_rows)} | best_train={format_metric(best_train_loss)} "
+            f"architect_finished | epochs={len(history_rows)} | best_val={format_metric(best_val_loss)} "
             f"| best_ckpt={best_path}"
         )
 
     finalize_latest_symlink(directories["latest_root"], directories["model_root"])
     return {
-        "best_train_loss": best_train_loss,
+        "best_val_loss": best_val_loss,
         "best_checkpoint": str(best_path),
         "last_checkpoint": str(last_path),
     }
