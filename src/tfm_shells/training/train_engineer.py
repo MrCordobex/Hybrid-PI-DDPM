@@ -21,6 +21,7 @@ from tfm_shells.models.factory import build_scheduler, build_unet, count_paramet
 from tfm_shells.training.common import (
     expand_physics_stats,
     finalize_latest_symlink,
+    format_metric,
     make_run_name,
     plot_training_curves,
     prepare_run_directories,
@@ -59,6 +60,9 @@ def _run_epoch(
     device: torch.device,
     lambda_epoch: float,
     include_fz_channel: bool,
+    epoch: int,
+    total_epochs: int,
+    phase: str,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -83,7 +87,8 @@ def _run_epoch(
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for batch in tqdm(loader, leave=False):
+        progress = tqdm(loader, leave=False, desc=f"{phase} {epoch:03d}/{total_epochs:03d}")
+        for batch in progress:
             z_clean = batch["z"].to(device, non_blocking=True)
             fz_cond = batch["fz_norm"].to(device, non_blocking=True)
             fz_real = batch["fz_real"].to(device, non_blocking=True)
@@ -140,6 +145,13 @@ def _run_epoch(
             total_membrane_mse += float(branch_losses["membrane_mse"].item()) * batch_size
             total_flexion_mse += float(branch_losses["flexion_mse"].item()) * batch_size
             total_items += batch_size
+            progress.set_postfix(
+                loss=format_metric(total_loss / max(total_items, 1)),
+                mse=format_metric(total_mse / max(total_items, 1)),
+                phys=format_metric(total_phys / max(total_items, 1)),
+                mf_mae=format_metric(total_mf_mae / max(total_items, 1)),
+                refresh=False,
+            )
 
     return {
         "loss": total_loss / max(total_items, 1),
@@ -252,6 +264,7 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
 
     model = build_unet(config["model"]).to(device)
     scheduler = build_scheduler(config["model"])
+    model_parameters = count_parameters(model)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config["training"]["learning_rate"]),
@@ -269,9 +282,36 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
     epochs_without_improvement = 0
     best_path = directories["model_root"] / "best.pt"
     last_path = directories["model_root"] / "last.pt"
+    total_epochs = int(config["training"]["epochs"])
 
     run_name = make_run_name(config, role="engineer")
     with ExperimentTracker(config, directories["project_root"], run_name) as tracker:
+        summary_filtered = splits["dataset_summary"]["all_filtered"]
+        print("\n" + "=" * 96)
+        print("ENGINEER TRAINING")
+        print(f"config: {config['_meta']['config_path']}")
+        print(f"device: {device}")
+        print(f"dataset: {dataset_dir}")
+        print(
+            f"records: filtered={summary_filtered['count']} "
+            f"train={len(train_records)} val={len(val_records)} "
+            f"subsets={summary_filtered['subset_counts']}"
+        )
+        print(
+            f"normalization: z=[{format_metric(float(stats['z_min']))}, {format_metric(float(stats['z_max']))}] "
+            f"fz=[{format_metric(float(stats['fz_min']))}, {format_metric(float(stats['fz_max']))}]"
+        )
+        print(
+            f"physics_channels={len(stats['physics_mean'])} "
+            f"lambda_max={format_metric(float(config['training']['lambda_max']))} "
+            f"warmup_epochs={int(config['training']['warmup_epochs'])}"
+        )
+        print(f"model_parameters: {model_parameters:,}")
+        print(f"artifacts: {directories['run_root']}")
+        print(f"checkpoints: {directories['model_root']}")
+        print(f"mlflow_run_id: {tracker.run_id}")
+        print("=" * 96)
+
         tracker.log_config(config)
         tracker.log_artifact(directories["run_root"] / "config.yaml", artifact_path="run")
         tracker.log_artifact(directories["run_root"] / "stats.json", artifact_path="run")
@@ -282,11 +322,11 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 "dataset_count_train": float(len(train_records)),
                 "dataset_count_val": float(len(val_records)),
                 "mf_mean_filtered": float(splits["dataset_summary"]["all_filtered"]["mf_mean"]),
-                "model_parameters": float(count_parameters(model)),
+                "model_parameters": float(model_parameters),
             }
         )
 
-        for epoch in range(1, int(config["training"]["epochs"]) + 1):
+        for epoch in range(1, total_epochs + 1):
             lambda_epoch = _epoch_lambda(config, epoch - 1)
             train_metrics = _run_epoch(
                 model=model,
@@ -298,6 +338,9 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 device=device,
                 lambda_epoch=lambda_epoch,
                 include_fz_channel=bool(config["data"]["include_fz_channel"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="train",
             )
             val_metrics = _run_epoch(
                 model=model,
@@ -309,6 +352,9 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 device=device,
                 lambda_epoch=lambda_epoch,
                 include_fz_channel=bool(config["data"]["include_fz_channel"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="val",
             )
             lr_scheduler.step(val_metrics["loss"])
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -357,10 +403,42 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 epochs_without_improvement = 0
                 torch.save(checkpoint, best_path)
                 tracker.log_metrics({"best_val_loss": best_val_loss}, step=epoch)
+                best_marker = " [best]"
             else:
                 epochs_without_improvement += 1
+                best_marker = ""
+
+            tqdm.write(
+                " | ".join(
+                    [
+                        f"epoch {epoch:03d}/{total_epochs:03d}",
+                        f"train_loss={format_metric(train_metrics['loss'])}",
+                        f"val_loss={format_metric(val_metrics['loss'])}",
+                        f"train_mse={format_metric(train_metrics['mse'])}",
+                        f"val_mse={format_metric(val_metrics['mse'])}",
+                        f"train_phys={format_metric(train_metrics['phys'])}",
+                        f"val_phys={format_metric(val_metrics['phys'])}",
+                        f"val_mf_mae={format_metric(val_metrics['mf_mae'])}",
+                        f"lambda={format_metric(lambda_epoch)}",
+                        f"lr={format_metric(current_lr)}",
+                        f"best_val={format_metric(best_val_loss)}{best_marker}",
+                    ]
+                )
+            )
+            tqdm.write(
+                " | ".join(
+                    [
+                        f"branches train(uz={format_metric(train_metrics['uz_mse'])}, m={format_metric(train_metrics['membrane_mse'])}, f={format_metric(train_metrics['flexion_mse'])})",
+                        f"val(uz={format_metric(val_metrics['uz_mse'])}, m={format_metric(val_metrics['membrane_mse'])}, f={format_metric(val_metrics['flexion_mse'])})",
+                        f"mf_pred={format_metric(val_metrics['mf_pred'])}",
+                        f"mf_true={format_metric(val_metrics['mf_true'])}",
+                        f"patience={epochs_without_improvement}/{int(config['training']['early_stopping_patience'])}",
+                    ]
+                )
+            )
 
             if epochs_without_improvement >= int(config["training"]["early_stopping_patience"]):
+                tqdm.write("early_stopping_triggered")
                 break
 
         save_history(history_rows, directories)
@@ -400,6 +478,10 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
         save_json(summary, directories["run_root"] / "summary.json")
         save_json(summary, directories["model_root"] / "summary.json")
         tracker.log_artifact(directories["run_root"] / "summary.json", artifact_path="run")
+        print(
+            f"engineer_finished | epochs={len(history_rows)} | best_val={format_metric(best_val_loss)} "
+            f"| best_ckpt={best_path}"
+        )
 
     finalize_latest_symlink(directories["latest_root"], directories["model_root"])
     return {

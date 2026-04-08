@@ -21,6 +21,7 @@ from tfm_shells.models.factory import build_scheduler, build_unet, count_paramet
 from tfm_shells.training.common import (
     architect_target,
     finalize_latest_symlink,
+    format_metric,
     make_run_name,
     plot_training_curves,
     prepare_run_directories,
@@ -95,6 +96,9 @@ def _run_epoch(
     mixed_precision: bool,
     grad_clip_norm: float,
     include_fz_channel: bool,
+    epoch: int,
+    total_epochs: int,
+    phase: str,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -108,7 +112,8 @@ def _run_epoch(
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for batch in tqdm(loader, leave=False):
+        progress = tqdm(loader, leave=False, desc=f"{phase} {epoch:03d}/{total_epochs:03d}")
+        for batch in progress:
             z_clean = batch["z"].to(device, non_blocking=True)
             fz_cond = batch["fz_norm"].to(device, non_blocking=True)
             batch_size = z_clean.shape[0]
@@ -141,6 +146,7 @@ def _run_epoch(
 
             total_loss += float(loss.item()) * batch_size
             total_items += batch_size
+            progress.set_postfix(loss=format_metric(total_loss / max(total_items, 1)), refresh=False)
 
     return {"loss": total_loss / max(total_items, 1)}
 
@@ -196,6 +202,7 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
 
     model = build_unet(config["model"]).to(device)
     scheduler = build_scheduler(config["model"])
+    model_parameters = count_parameters(model)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -214,9 +221,31 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
     epochs_without_improvement = 0
     best_path = directories["model_root"] / "best.pt"
     last_path = directories["model_root"] / "last.pt"
+    total_epochs = int(config["training"]["epochs"])
 
     run_name = make_run_name(config, role="architect")
     with ExperimentTracker(config, directories["project_root"], run_name) as tracker:
+        summary_filtered = splits["dataset_summary"]["all_filtered"]
+        print("\n" + "=" * 96)
+        print("ARCHITECT TRAINING")
+        print(f"config: {config['_meta']['config_path']}")
+        print(f"device: {device}")
+        print(f"dataset: {dataset_dir}")
+        print(
+            f"records: filtered={summary_filtered['count']} "
+            f"train={len(train_records)} val={len(val_records)} "
+            f"subsets={summary_filtered['subset_counts']}"
+        )
+        print(
+            f"normalization: z=[{format_metric(float(stats['z_min']))}, {format_metric(float(stats['z_max']))}] "
+            f"fz=[{format_metric(float(stats['fz_min']))}, {format_metric(float(stats['fz_max']))}]"
+        )
+        print(f"model_parameters: {model_parameters:,}")
+        print(f"artifacts: {directories['run_root']}")
+        print(f"checkpoints: {directories['model_root']}")
+        print(f"mlflow_run_id: {tracker.run_id}")
+        print("=" * 96)
+
         tracker.log_config(config)
         tracker.log_artifact(directories["run_root"] / "config.yaml", artifact_path="run")
         tracker.log_artifact(directories["run_root"] / "stats.json", artifact_path="run")
@@ -227,11 +256,11 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 "dataset_count_train": float(len(train_records)),
                 "dataset_count_val": float(len(val_records)),
                 "mf_mean_filtered": float(splits["dataset_summary"]["all_filtered"]["mf_mean"]),
-                "model_parameters": float(count_parameters(model)),
+                "model_parameters": float(model_parameters),
             }
         )
 
-        for epoch in range(1, int(config["training"]["epochs"]) + 1):
+        for epoch in range(1, total_epochs + 1):
             train_metrics = _run_epoch(
                 model=model,
                 loader=train_loader,
@@ -241,6 +270,9 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 mixed_precision=bool(config["training"]["mixed_precision"]),
                 grad_clip_norm=float(config["training"]["grad_clip_norm"]),
                 include_fz_channel=bool(config["data"]["include_fz_channel"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="train",
             )
             val_metrics = _run_epoch(
                 model=model,
@@ -251,6 +283,9 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 mixed_precision=bool(config["training"]["mixed_precision"]),
                 grad_clip_norm=float(config["training"]["grad_clip_norm"]),
                 include_fz_channel=bool(config["data"]["include_fz_channel"]),
+                epoch=epoch,
+                total_epochs=total_epochs,
+                phase="val",
             )
             lr_scheduler.step(val_metrics["loss"])
             current_lr = float(optimizer.param_groups[0]["lr"])
@@ -282,8 +317,23 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 epochs_without_improvement = 0
                 torch.save(checkpoint, best_path)
                 tracker.log_metrics({"best_val_loss": best_val_loss}, step=epoch)
+                best_marker = " [best]"
             else:
                 epochs_without_improvement += 1
+                best_marker = ""
+
+            tqdm.write(
+                " | ".join(
+                    [
+                        f"epoch {epoch:03d}/{total_epochs:03d}",
+                        f"train_loss={format_metric(train_metrics['loss'])}",
+                        f"val_loss={format_metric(val_metrics['loss'])}",
+                        f"best_val={format_metric(best_val_loss)}{best_marker}",
+                        f"lr={format_metric(current_lr)}",
+                        f"patience={epochs_without_improvement}/{int(config['training']['early_stopping_patience'])}",
+                    ]
+                )
+            )
 
             sample_every = int(config["training"]["sample_every_n_epochs"])
             if epoch == 1 or epoch % sample_every == 0:
@@ -300,8 +350,10 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
                 sample_path = directories["run_root"] / f"samples_epoch_{epoch:03d}.png"
                 _save_sample_grid(samples, stats, sample_path)
                 tracker.log_artifact(sample_path, artifact_path="samples")
+                tqdm.write(f"saved_samples: {sample_path}")
 
             if epochs_without_improvement >= int(config["training"]["early_stopping_patience"]):
+                tqdm.write("early_stopping_triggered")
                 break
 
         save_history(history_rows, directories)
@@ -327,6 +379,10 @@ def train_architect(config_path: str | Path) -> dict[str, Any]:
         save_json(summary, directories["run_root"] / "summary.json")
         save_json(summary, directories["model_root"] / "summary.json")
         tracker.log_artifact(directories["run_root"] / "summary.json", artifact_path="run")
+        print(
+            f"architect_finished | epochs={len(history_rows)} | best_val={format_metric(best_val_loss)} "
+            f"| best_ckpt={best_path}"
+        )
 
     finalize_latest_symlink(directories["latest_root"], directories["model_root"])
     return {

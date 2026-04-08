@@ -158,3 +158,12 @@ def polynomial_guidance_weight(step_index: int, total_steps: int, w_min: float, 
         return float(w_max)
     progress = step_index / float(total_steps - 1)
     return float(w_min + (w_max - w_min) * (progress ** power))
+
+
+def format_metric(value: float) -> str:
+    if not math.isfinite(value):
+        return str(value)
+    magnitude = abs(value)
+    if magnitude != 0.0 and (magnitude < 1e-3 or magnitude >= 1e3):
+        return f"{value:.3e}"
+    return f"{value:.5f}"
