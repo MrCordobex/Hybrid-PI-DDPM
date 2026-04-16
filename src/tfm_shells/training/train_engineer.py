@@ -33,21 +33,46 @@ from tfm_shells.training.common import (
 )
 from tfm_shells.utils.io import save_json
 from tfm_shells.utils.physics import (
+    build_active_refinement_mask,
     branchwise_supervised_losses,
     compute_membrane_factor_from_prediction,
     compute_physical_residual,
+    compute_energy_residual_map,
+    compute_weak_form_residual,
 )
 from tfm_shells.utils.tracking import ExperimentTracker
 
 
-def _epoch_lambda(config: dict[str, Any], epoch_index: int) -> float:
-    warmup = int(config["training"]["warmup_epochs"])
-    lambda_max = float(config["training"]["lambda_max"])
-    total_epochs = int(config["training"]["epochs"])
+def _epoch_weight(lambda_max: float, warmup: int, total_epochs: int, epoch_index: int) -> float:
     if epoch_index < warmup:
         return 0.0
     progress = (epoch_index - warmup) / max(total_epochs - warmup, 1)
     return lambda_max * min(max(progress, 0.0), 1.0)
+
+
+def _epoch_lambda(config: dict[str, Any], epoch_index: int) -> float:
+    return _epoch_weight(
+        lambda_max=float(config["training"]["lambda_max"]),
+        warmup=int(config["training"]["warmup_epochs"]),
+        total_epochs=int(config["training"]["epochs"]),
+        epoch_index=epoch_index,
+    )
+
+
+def _nested_epoch_lambda(
+    training_cfg: dict[str, Any],
+    section_name: str,
+    epoch_index: int,
+) -> float:
+    section = training_cfg.get(section_name, {})
+    if not bool(section.get("enabled", False)):
+        return 0.0
+    return _epoch_weight(
+        lambda_max=float(section.get("lambda_max", 0.0)),
+        warmup=int(section.get("warmup_epochs", training_cfg["warmup_epochs"])),
+        total_epochs=int(training_cfg["epochs"]),
+        epoch_index=epoch_index,
+    )
 
 
 def _run_epoch(
@@ -74,6 +99,9 @@ def _run_epoch(
     total_loss = 0.0
     total_mse = 0.0
     total_phys = 0.0
+    total_weak = 0.0
+    total_refine = 0.0
+    total_uncertainty = 0.0
     total_mf_pred = 0.0
     total_mf_true = 0.0
     total_mf_mae = 0.0
@@ -84,6 +112,11 @@ def _run_epoch(
 
     power = float(config["training"]["timestep_power"])
     t_max = int(scheduler.config.num_train_timesteps)
+    weak_form_cfg = config["training"].get("weak_form", {})
+    active_refinement_cfg = config["training"].get("active_refinement", {})
+    use_uncertainty_weighting = bool(config["training"].get("uncertainty_weighting", False))
+    weak_lambda_epoch = _nested_epoch_lambda(config["training"], "weak_form", epoch - 1)
+    refine_lambda_epoch = _nested_epoch_lambda(config["training"], "active_refinement", epoch - 1)
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
@@ -109,8 +142,19 @@ def _run_epoch(
 
             with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
                 model_input = torch.cat([z_noisy, fz_cond], dim=1) if include_fz_channel else z_noisy
-                pred_norm = model(model_input, timesteps).sample
-                loss_mse = F.mse_loss(pred_norm, physics_clean)
+                model_output = model(model_input, timesteps)
+                pred_norm = model_output.sample
+                log_variance = getattr(model_output, "log_variance", None)
+                if log_variance is not None and log_variance.shape[1] == 1:
+                    log_variance = log_variance.expand(-1, pred_norm.shape[1], -1, -1)
+
+                sq_error = (pred_norm - physics_clean).square()
+                if use_uncertainty_weighting and log_variance is not None:
+                    loss_mse = (0.5 * (torch.exp(-log_variance) * sq_error + log_variance)).mean()
+                    mean_uncertainty = torch.exp(log_variance.detach()).mean()
+                else:
+                    loss_mse = sq_error.mean()
+                    mean_uncertainty = torch.tensor(0.0, device=device)
                 branch_losses = branchwise_supervised_losses(pred_norm, physics_clean)
 
                 if lambda_epoch > 0.0:
@@ -118,7 +162,48 @@ def _run_epoch(
                     weighted_phys = (phys_per_sample * timestep_weights(timesteps, t_max, power)).mean()
                 else:
                     weighted_phys = torch.tensor(0.0, device=device)
-                loss = loss_mse + lambda_epoch * weighted_phys
+
+                if weak_lambda_epoch > 0.0:
+                    weak_per_sample = compute_weak_form_residual(
+                        pred_norm,
+                        p_mean,
+                        p_std,
+                        ds,
+                        dv,
+                        fz_real,
+                        num_test_modes=int(weak_form_cfg.get("num_test_modes", 4)),
+                    )
+                    weak_loss = weak_per_sample.mean()
+                else:
+                    weak_loss = torch.tensor(0.0, device=device)
+
+                if refine_lambda_epoch > 0.0:
+                    residual_map = compute_energy_residual_map(pred_norm, p_mean, p_std, ds, dv, fz_real).detach()
+                    uncertainty_map = None
+                    if log_variance is not None:
+                        uncertainty_map = torch.exp(log_variance.detach().mean(dim=1, keepdim=True))
+                    refine_mask = build_active_refinement_mask(
+                        residual_map=residual_map,
+                        uncertainty_map=uncertainty_map,
+                        topk_ratio=float(active_refinement_cfg.get("topk_ratio", 0.20)),
+                        residual_weight=float(active_refinement_cfg.get("residual_weight", 0.5)),
+                        uncertainty_weight=float(active_refinement_cfg.get("uncertainty_weight", 0.5)),
+                    )
+                    local_sq_error = sq_error.mean(dim=1, keepdim=True)
+                    refine_per_sample = (
+                        (refine_mask * local_sq_error).sum(dim=(1, 2, 3))
+                        / refine_mask.sum(dim=(1, 2, 3)).clamp_min(1.0)
+                    )
+                    refine_loss = refine_per_sample.mean()
+                else:
+                    refine_loss = torch.tensor(0.0, device=device)
+
+                loss = (
+                    loss_mse
+                    + lambda_epoch * weighted_phys
+                    + weak_lambda_epoch * weak_loss
+                    + refine_lambda_epoch * refine_loss
+                )
 
             if is_train:
                 scaler.scale(loss).backward()
@@ -138,6 +223,9 @@ def _run_epoch(
             total_loss += float(loss.item()) * batch_size
             total_mse += float(loss_mse.item()) * batch_size
             total_phys += float(weighted_phys.item()) * batch_size
+            total_weak += float(weak_loss.item()) * batch_size
+            total_refine += float(refine_loss.item()) * batch_size
+            total_uncertainty += float(mean_uncertainty.item()) * batch_size
             total_mf_pred += float(mf_pred_mean.mean().item()) * batch_size
             total_mf_true += float(mf_true_mean.mean().item()) * batch_size
             total_mf_mae += float(mf_mae.mean().item()) * batch_size
@@ -149,6 +237,8 @@ def _run_epoch(
                 loss=format_metric(total_loss / max(total_items, 1)),
                 mse=format_metric(total_mse / max(total_items, 1)),
                 phys=format_metric(total_phys / max(total_items, 1)),
+                weak=format_metric(total_weak / max(total_items, 1)),
+                refine=format_metric(total_refine / max(total_items, 1)),
                 mf_mae=format_metric(total_mf_mae / max(total_items, 1)),
                 refresh=False,
             )
@@ -157,6 +247,9 @@ def _run_epoch(
         "loss": total_loss / max(total_items, 1),
         "mse": total_mse / max(total_items, 1),
         "phys": total_phys / max(total_items, 1),
+        "weak": total_weak / max(total_items, 1),
+        "refine": total_refine / max(total_items, 1),
+        "uncertainty": total_uncertainty / max(total_items, 1),
         "mf_pred": total_mf_pred / max(total_items, 1),
         "mf_true": total_mf_true / max(total_items, 1),
         "mf_mae": total_mf_mae / max(total_items, 1),
@@ -306,6 +399,11 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
             f"lambda_max={format_metric(float(config['training']['lambda_max']))} "
             f"warmup_epochs={int(config['training']['warmup_epochs'])}"
         )
+        print(
+            f"weak_form={bool(config['training'].get('weak_form', {}).get('enabled', False))} "
+            f"active_refinement={bool(config['training'].get('active_refinement', {}).get('enabled', False))} "
+            f"uncertainty_weighting={bool(config['training'].get('uncertainty_weighting', False))}"
+        )
         print(f"model_parameters: {model_parameters:,}")
         print(f"artifacts: {directories['run_root']}")
         print(f"checkpoints: {directories['model_root']}")
@@ -367,6 +465,12 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 "val_mse": val_metrics["mse"],
                 "train_phys": train_metrics["phys"],
                 "val_phys": val_metrics["phys"],
+                "train_weak": train_metrics["weak"],
+                "val_weak": val_metrics["weak"],
+                "train_refine": train_metrics["refine"],
+                "val_refine": val_metrics["refine"],
+                "train_uncertainty": train_metrics["uncertainty"],
+                "val_uncertainty": val_metrics["uncertainty"],
                 "train_mf_pred": train_metrics["mf_pred"],
                 "val_mf_pred": val_metrics["mf_pred"],
                 "train_mf_true": train_metrics["mf_true"],
@@ -418,6 +522,9 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                         f"val_mse={format_metric(val_metrics['mse'])}",
                         f"train_phys={format_metric(train_metrics['phys'])}",
                         f"val_phys={format_metric(val_metrics['phys'])}",
+                        f"train_weak={format_metric(train_metrics['weak'])}",
+                        f"val_weak={format_metric(val_metrics['weak'])}",
+                        f"val_refine={format_metric(val_metrics['refine'])}",
                         f"val_mf_mae={format_metric(val_metrics['mf_mae'])}",
                         f"lambda={format_metric(lambda_epoch)}",
                         f"lr={format_metric(current_lr)}",
@@ -449,6 +556,7 @@ def train_engineer(config_path: str | Path) -> dict[str, Any]:
                 ("train_loss", "val_loss"),
                 ("train_mse", "val_mse"),
                 ("train_mf_mae", "val_mf_mae"),
+                ("train_weak", "val_weak"),
             ],
             title="Engineer training curves",
             output_path=curves_path,

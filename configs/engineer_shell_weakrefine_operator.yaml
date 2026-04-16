@@ -1,0 +1,71 @@
+seed: 42
+
+data:
+  dataset_dir: ../Datos/processed_image2/processed_image2
+  subset: all
+  min_mf_mean: null
+  val_ratio: 0.20
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  include_fz_channel: true
+
+model:
+  kind: shell_weakrefine_operator
+  sample_size: 64
+  in_channels: 2
+  out_channels: 13
+  branch_channels:
+    u: 1
+    m: 6
+    f: 6
+  operator_width: 128
+  num_operator_layers: 6
+  spectral_modes_height: 16
+  spectral_modes_width: 16
+  time_embedding_dim: 256
+  branch_hidden_channels: 128
+  use_coordinate_grid: true
+  predict_log_variance: true
+  dropout: 0.05
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: v_prediction
+
+training:
+  epochs: 60
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip_norm: 1.0
+  lr_patience: 8
+  lr_factor: 0.5
+  early_stopping_patience: 15
+  mixed_precision: false
+  lambda_max: 5.0e-4
+  warmup_epochs: 10
+  timestep_power: 2.0
+  uncertainty_weighting: true
+  weak_form:
+    enabled: true
+    lambda_max: 1.0e-3
+    warmup_epochs: 5
+    num_test_modes: 4
+  active_refinement:
+    enabled: true
+    lambda_max: 2.0e-1
+    warmup_epochs: 5
+    topk_ratio: 0.20
+    residual_weight: 0.55
+    uncertainty_weight: 0.45
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: engineer_shell_weakrefine_operator
+  run_name_prefix: engineer_swo
+  tags:
+    model_role: engineer
+    model_family: shell_weakrefine_operator
+    stage: thesis
+
+runtime:
+  device: auto
+  project_name: tfm_shells

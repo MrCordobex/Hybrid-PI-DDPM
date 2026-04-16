@@ -7,6 +7,7 @@ from diffusers import DDPMScheduler, UNet2DModel
 
 from tfm_shells.models.equino import EquiNOModel
 from tfm_shells.models.parallel_pb_unet import ParallelPBUNet
+from tfm_shells.models.shell_weakrefine_operator import ShellWeakRefineOperator
 
 
 def build_unet(model_config: dict[str, Any]) -> torch.nn.Module:
@@ -36,6 +37,22 @@ def build_unet(model_config: dict[str, Any]) -> torch.nn.Module:
             modal_residual_weight=float(model_config.get("modal_residual_weight", 0.25)),
             branch_channels=model_config.get("branch_channels"),
             use_coordinate_grid=bool(model_config.get("use_coordinate_grid", True)),
+            dropout=float(model_config.get("dropout", 0.0)),
+        )
+    if kind == "shell_weakrefine_operator":
+        return ShellWeakRefineOperator(
+            sample_size=int(model_config["sample_size"]),
+            in_channels=int(model_config["in_channels"]),
+            out_channels=int(model_config["out_channels"]),
+            operator_width=int(model_config.get("operator_width", 128)),
+            num_operator_layers=int(model_config.get("num_operator_layers", 6)),
+            spectral_modes_height=int(model_config.get("spectral_modes_height", 16)),
+            spectral_modes_width=int(model_config.get("spectral_modes_width", 16)),
+            time_embedding_dim=int(model_config.get("time_embedding_dim", 256)),
+            branch_hidden_channels=int(model_config.get("branch_hidden_channels", 128)),
+            branch_channels=model_config.get("branch_channels"),
+            use_coordinate_grid=bool(model_config.get("use_coordinate_grid", True)),
+            predict_log_variance=bool(model_config.get("predict_log_variance", True)),
             dropout=float(model_config.get("dropout", 0.0)),
         )
     return UNet2DModel(
