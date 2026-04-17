@@ -41,3 +41,7 @@ Thumbs.db
 !/src/
 !/src/**/
 !/src/**/*.py
+
+
+#Comparaciones entre modelos
+comparation/
