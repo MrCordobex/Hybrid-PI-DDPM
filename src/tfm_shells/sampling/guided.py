@@ -10,11 +10,13 @@ configure_matplotlib_backend()
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
-from tfm_shells.config import load_config, resolve_project_path
+from tfm_shells.config import load_config, resolve_project_path, save_config
 from tfm_shells.models.factory import build_scheduler, build_unet
 from tfm_shells.training.common import (
     bell_guidance_weight,
+    format_metric,
     make_run_name,
     polynomial_guidance_weight,
     prepare_run_directories,
@@ -74,6 +76,8 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     directories = prepare_run_directories(config, role="sample")
     runtime_cfg = config.get("runtime", {})
     device = resolve_device(str(runtime_cfg.get("device", "auto")))
+    save_config(config, directories["run_root"] / "config.yaml")
+    save_config(config, directories["model_root"] / "config.yaml")
 
     architect_ckpt = _load_checkpoint(resolve_project_path(config, config["architect"]["checkpoint"]), device)
     engineer_ckpt = _load_checkpoint(resolve_project_path(config, config["engineer"]["checkpoint"]), device)
@@ -104,7 +108,9 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     p_mean = torch.tensor(eng_stats["physics_mean"], dtype=torch.float32, device=device).unsqueeze(0)
     p_std = torch.tensor(eng_stats["physics_std"], dtype=torch.float32, device=device).unsqueeze(0)
 
-    for index, timestep in enumerate(scheduler.timesteps):
+    total_steps = len(scheduler.timesteps)
+    progress = tqdm(scheduler.timesteps, desc=f"sample 0000/{total_steps:04d}", leave=True)
+    for index, timestep in enumerate(progress, start=1):
         t_value = int(timestep.item())
         t_batch = torch.full((x.shape[0],), t_value, device=device, dtype=torch.long)
 
@@ -124,25 +130,38 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
         pred_phys_real = pred_phys_norm * p_std + p_mean
         mf_map = compute_membrane_factor_map_from_real_physics(pred_phys_real)
         mf_mean = mf_map.mean(dim=(1, 2, 3))
-        objective = ((1.0 - mf_mean) ** 2).mean()
+        objective_per_sample = (1.0 - mf_mean) ** 2
+        # Use a batch-invariant guidance objective: each sample contributes its
+        # own gradient with the same strength regardless of batch size.
+        objective_for_grad = objective_per_sample.sum()
+        objective = objective_per_sample.mean()
 
-        grad = torch.autograd.grad(objective, x_req, retain_graph=False, create_graph=False)[0]
-        guide_weight = _bell_or_poly(config, index, len(scheduler.timesteps))
+        grad = torch.autograd.grad(objective_for_grad, x_req, retain_graph=False, create_graph=False)[0]
+        guide_weight = _bell_or_poly(config, index - 1, total_steps)
         grad = torch.clamp(
             guide_weight * float(config["sampling"]["guidance_scale"]) * grad,
             min=-float(config["sampling"]["grad_clip"]),
             max=float(config["sampling"]["grad_clip"]),
         )
+        grad_norm = float(grad.flatten(1).norm(dim=1).mean().item())
+        mf_mean_value = float(mf_mean.mean().item())
 
         alpha_bar_t = scheduler.alphas_cumprod[timestep].to(device)
         sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
         guided_output = model_output + sqrt_one_minus_alpha_bar * grad
         x = scheduler.step(guided_output, timestep, x).prev_sample
 
+        progress.set_description(f"sample {index:04d}/{total_steps:04d}")
+        progress.set_postfix(
+            grad_norm=format_metric(grad_norm),
+            w=format_metric(float(guide_weight)),
+            mf=format_metric(mf_mean_value),
+            refresh=False,
+        )
         history["t"].append(t_value)
         history["objective"].append(float(objective.item()))
-        history["mf_mean"].append(float(mf_mean.mean().item()))
-        history["grad_norm"].append(float(grad.flatten(1).norm(dim=1).mean().item()))
+        history["mf_mean"].append(mf_mean_value)
+        history["grad_norm"].append(grad_norm)
         history["guide_weight"].append(float(guide_weight))
 
     z_min = float(arch_stats["z_min"])
@@ -186,6 +205,7 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
     run_name = make_run_name(config, role="sample")
     with ExperimentTracker(config, directories["project_root"], run_name) as tracker:
         tracker.log_config(config)
+        tracker.log_artifact(directories["run_root"] / "config.yaml", artifact_path="run")
         tracker.log_metrics(
             {
                 "samples_generated": float(samples_real.shape[0]),
@@ -199,9 +219,18 @@ def run_guided_sampling(config_path: str | Path) -> dict[str, Any]:
         tracker.log_artifact(history_png, artifact_path="samples")
 
     summary = {
+        "config_file": str(directories["run_root"] / "config.yaml"),
         "samples_file": str(output_npz),
         "plot_file": str(samples_png),
+        "history_plot_file": str(history_png),
+        "batch_invariant_guidance": True,
+        "guidance_objective_reduction": "sum_for_grad_mean_for_logging",
+        "samples_generated": int(samples_real.shape[0]),
+        "sample_shape": list(samples_real.shape),
+        "conditioning_source_file": str(source_file),
+        "num_inference_steps": int(config["sampling"]["num_inference_steps"]),
         "final_mf_mean": float(history["mf_mean"][-1]),
     }
     save_json(summary, directories["run_root"] / "summary.json")
+    save_json(summary, directories["model_root"] / "summary.json")
     return summary
