@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +34,9 @@ from tfm_shells.utils.physics import compute_membrane_factor_from_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENGINEER = PROJECT_ROOT / "models" / "engineer" / "20260416_142218_engineer" / "best.pt"
-DEFAULT_CLEAN = PROJECT_ROOT / "models" / "modelo_clean" / "best.pt"
-FALLBACK_CLEAN = PROJECT_ROOT / "models" / "engineer" / "modelo_clean" / "best.pt"
+DEFAULT_CLEAN = PROJECT_ROOT / "models" / "engineer" / "modelo_clean" / "best.pt"
+LEGACY_CLEAN = PROJECT_ROOT / "models" / "modelo_clean" / "best.pt"
+TYPO_CLEAN = PROJECT_ROOT / "models" / "enginieers" / "modelo_clean" / "best.pt"
 DEFAULT_ARCHITECT = PROJECT_ROOT / "models" / "architect" / "latest" / "best.pt"
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "engineer.yaml"
 
@@ -43,7 +45,6 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "engineer.yaml"
 class LoadedModel:
     name: str
     model: torch.nn.Module
-    checkpoint: dict[str, Any]
     scheduler: Any
     stats: dict[str, Any]
     include_fz: bool
@@ -70,31 +71,90 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
-    return torch.load(path, map_location=device, weights_only=False)
+def log(message: str) -> None:
+    print(f"[E_DANI] {message}", flush=True)
+
+
+def format_gb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f} GB"
+
+
+def as_project_path(path: Path) -> Path:
+    path = Path(path).expanduser()
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def load_checkpoint(path: Path, label: str) -> dict[str, Any]:
+    path = as_project_path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"{label} checkpoint not found: {path}")
+    stat = path.stat()
+    log(f"{label}: torch.load START | path={path} | size={format_gb(stat.st_size)} | map_location=cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    keys = ", ".join(sorted(str(key) for key in checkpoint.keys()))
+    log(f"{label}: torch.load DONE | keys=[{keys}]")
+    return checkpoint
 
 
 def resolve_clean_checkpoint(path: Path) -> Path:
+    path = as_project_path(path)
     if path.exists():
         return path
-    if FALLBACK_CLEAN.exists():
-        return FALLBACK_CLEAN
+    for candidate in (DEFAULT_CLEAN, LEGACY_CLEAN, TYPO_CLEAN):
+        if candidate.exists():
+            log(f"clean checkpoint requested path missing; using existing candidate: {candidate}")
+            return candidate
     raise FileNotFoundError(f"Clean checkpoint not found: {path}")
 
 
-def load_surrogate(name: str, checkpoint_path: Path, device: torch.device) -> LoadedModel:
-    checkpoint = load_checkpoint(checkpoint_path, device)
-    model = build_unet(checkpoint["model_config"]).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+def load_surrogate(
+    name: str,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> LoadedModel:
+    checkpoint = load_checkpoint(checkpoint_path, label=name)
+    model_config = checkpoint["model_config"]
+    stats = checkpoint["normalization_stats"]
+    log(f"{name}: build_unet START | kind={model_config.get('kind', 'unet')} | device={device}")
+    model = build_unet(model_config).to(device)
+    log(f"{name}: build_unet DONE")
+    log(f"{name}: load_state_dict START")
+    state_dict = checkpoint["model_state_dict"]
+    model.load_state_dict(state_dict)
+    log(f"{name}: load_state_dict DONE")
     model.eval()
+    del checkpoint, state_dict
+    gc.collect()
     return LoadedModel(
         name=name,
         model=model,
-        checkpoint=checkpoint,
-        scheduler=build_scheduler(checkpoint["model_config"]),
-        stats=checkpoint["normalization_stats"],
-        include_fz=int(checkpoint["model_config"].get("in_channels", 1)) > 1,
+        scheduler=build_scheduler(model_config),
+        stats=stats,
+        include_fz=int(model_config.get("in_channels", 1)) > 1,
     )
+
+
+def load_architect(
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+    checkpoint = load_checkpoint(checkpoint_path, label="architect")
+    model_config = checkpoint["model_config"]
+    stats = checkpoint["normalization_stats"]
+    log(f"architect: build_unet START | kind={model_config.get('kind', 'unet')} | device={device}")
+    model = build_unet(model_config).to(device)
+    log("architect: build_unet DONE")
+    log("architect: load_state_dict START")
+    state_dict = checkpoint["model_state_dict"]
+    model.load_state_dict(state_dict)
+    log("architect: load_state_dict DONE")
+    model.eval()
+    scheduler = build_scheduler(model_config)
+    del checkpoint, state_dict
+    gc.collect()
+    return model, scheduler, stats
 
 
 def minmax_denorm(x_norm: torch.Tensor, minimum: float, maximum: float) -> torch.Tensor:
@@ -205,6 +265,11 @@ def evaluate_timestep_curves(
     timesteps = list(range(0, t_max, int(args.timestep_stride)))
     if timesteps[-1] != t_max - 1:
         timesteps.append(t_max - 1)
+    log(
+        "timestep evaluation config | "
+        f"num_timesteps={len(timesteps)} | stride={args.timestep_stride} | "
+        f"batch_size={args.eval_batch_size} | max_batches={args.eval_max_batches}"
+    )
 
     rows: list[dict[str, float | int | str]] = []
     generator = torch.Generator(device=device)
@@ -263,7 +328,9 @@ def evaluate_timestep_curves(
         writer = csv.DictWriter(handle, fieldnames=["variant", "timestep", "physics_mse", "mf_mae", "grad_norm"])
         writer.writeheader()
         writer.writerows(rows)
+    log(f"timestep metrics written: {csv_path}")
     plot_error_gradient(rows, output_dir / "timestep_error_gradient.png")
+    log(f"timestep figure written: {output_dir / 'timestep_error_gradient.png'}")
     return rows
 
 
@@ -356,17 +423,19 @@ def run_guided_single_sample(
     device: torch.device,
     output_dir: Path,
 ) -> dict[str, Any]:
-    architect_ckpt = load_checkpoint(architect_path, device)
-    architect = build_unet(architect_ckpt["model_config"]).to(device)
-    architect.load_state_dict(architect_ckpt["model_state_dict"])
-    architect.eval()
-    architect_scheduler = build_scheduler(architect_ckpt["model_config"])
+    architect, architect_scheduler, arch_stats = load_architect(
+        architect_path,
+        device=device,
+    )
     architect_scheduler.set_timesteps(int(args.sample_steps), device=device)
+    log(
+        "guided sampling config | "
+        f"sample_steps={args.sample_steps} | guidance_scale={args.guidance_scale} | "
+        f"guidance_clip={args.guidance_clip}"
+    )
 
     batch = next(iter(loader))
     fz_real = batch["fz_real"][:1].to(device)
-    arch_stats = architect_ckpt["normalization_stats"]
-    eng_stats = engineer.stats
     fz_real_for_output = fz_real.detach().cpu().numpy()
 
     variants = ["engineer_time", "clean_xt", "clean_tweedie_x0"]
@@ -374,6 +443,7 @@ def run_guided_single_sample(
     samples: dict[str, np.ndarray] = {}
 
     for variant in variants:
+        log(f"guided variant START: {variant}")
         seed_everything(int(args.seed))
         generator = torch.Generator(device=device)
         generator.manual_seed(int(args.seed))
@@ -417,13 +487,17 @@ def run_guided_single_sample(
         z_real = minmax_denorm(x.detach(), float(arch_stats["z_min"]), float(arch_stats["z_max"]))
         samples[variant] = z_real.cpu().numpy()
         histories[variant] = history
+        log(f"guided variant DONE: {variant}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_dir / "guided_single_sample.npz", fz=fz_real_for_output, **samples)
+    log(f"guided samples written: {output_dir / 'guided_single_sample.npz'}")
     with (output_dir / "guided_histories.json").open("w", encoding="utf-8") as handle:
         json.dump(histories, handle, indent=2)
+    log(f"guided histories written: {output_dir / 'guided_histories.json'}")
     plot_guided_samples(samples, output_dir / "guided_single_sample.png")
     plot_guided_histories(histories, output_dir / "guided_histories.png")
+    log(f"guided figures written: {output_dir / 'guided_single_sample.png'} and {output_dir / 'guided_histories.png'}")
     return {"variants": variants, "sample_npz": str(output_dir / "guided_single_sample.npz")}
 
 
@@ -478,27 +552,48 @@ def main() -> None:
     config = load_config(args.config)
     output_dir = args.output_dir.resolve()
 
-    clean_path = resolve_clean_checkpoint(args.clean_checkpoint.resolve())
-    engineer = load_surrogate("engineer_time", args.engineer_checkpoint.resolve(), device)
-    clean = load_surrogate("clean", clean_path, device)
+    log(f"START | device={device} | seed={args.seed}")
+    log(f"config={args.config}")
+    clean_path = resolve_clean_checkpoint(args.clean_checkpoint)
+    engineer_path = as_project_path(args.engineer_checkpoint)
+    architect_path = as_project_path(args.architect_checkpoint)
+    log(f"engineer_checkpoint={engineer_path}")
+    log(f"clean_checkpoint={clean_path}")
+    log(f"architect_checkpoint={architect_path}")
+    engineer = load_surrogate(
+        "engineer_time",
+        engineer_path,
+        device,
+    )
+    clean = load_surrogate(
+        "clean",
+        clean_path,
+        device,
+    )
+    log("validation loader START")
     loader = build_validation_loader(config, engineer.stats, int(args.eval_batch_size))
+    log("validation loader DONE")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    log("timestep evaluation START")
     evaluate_timestep_curves(engineer, clean, loader, args, device, output_dir)
+    log("timestep evaluation DONE")
+    log("guided single sample START")
     guide_summary = run_guided_single_sample(
         engineer=engineer,
         clean=clean,
-        architect_path=args.architect_checkpoint.resolve(),
+        architect_path=architect_path,
         loader=loader,
         args=args,
         device=device,
         output_dir=output_dir,
     )
+    log("guided single sample DONE")
 
     summary = {
-        "engineer_checkpoint": str(args.engineer_checkpoint.resolve()),
+        "engineer_checkpoint": str(engineer_path),
         "clean_checkpoint": str(clean_path),
-        "architect_checkpoint": str(args.architect_checkpoint.resolve()),
+        "architect_checkpoint": str(architect_path),
         "output_dir": str(output_dir),
         "timestep_stride": int(args.timestep_stride),
         "guidance_scale": float(args.guidance_scale),
