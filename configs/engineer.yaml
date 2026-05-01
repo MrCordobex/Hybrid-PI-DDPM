@@ -2,7 +2,7 @@ seed: 42
 
 data:
   dataset_dir: ../Datos/processed_image2/processed_image2
-  subset: all
+  subset: solid
   min_mf_mean: null
   val_ratio: 0.20
   batch_size: 8
