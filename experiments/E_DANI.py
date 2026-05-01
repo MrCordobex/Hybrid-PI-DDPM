@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--timestep-stride", type=int, default=50)
-    parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--eval-max-batches", type=int, default=None)
     parser.add_argument("--sample-steps", type=int, default=1000)
     parser.add_argument("--guidance-scale", type=float, default=10.0)
@@ -86,13 +86,13 @@ def as_project_path(path: Path) -> Path:
     return PROJECT_ROOT / path
 
 
-def load_checkpoint(path: Path, label: str) -> dict[str, Any]:
+def load_checkpoint(path: Path, label: str, device: torch.device) -> dict[str, Any]:
     path = as_project_path(path)
     if not path.exists():
         raise FileNotFoundError(f"{label} checkpoint not found: {path}")
     stat = path.stat()
-    log(f"{label}: torch.load START | path={path} | size={format_gb(stat.st_size)} | map_location=cpu")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    log(f"{label}: torch.load START | path={path} | size={format_gb(stat.st_size)} | map_location={device}")
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     keys = ", ".join(sorted(str(key) for key in checkpoint.keys()))
     log(f"{label}: torch.load DONE | keys=[{keys}]")
     return checkpoint
@@ -114,7 +114,7 @@ def load_surrogate(
     checkpoint_path: Path,
     device: torch.device,
 ) -> LoadedModel:
-    checkpoint = load_checkpoint(checkpoint_path, label=name)
+    checkpoint = load_checkpoint(checkpoint_path, label=name, device=device)
     model_config = checkpoint["model_config"]
     stats = checkpoint["normalization_stats"]
     log(f"{name}: build_unet START | kind={model_config.get('kind', 'unet')} | device={device}")
@@ -140,7 +140,7 @@ def load_architect(
     checkpoint_path: Path,
     device: torch.device,
 ) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
-    checkpoint = load_checkpoint(checkpoint_path, label="architect")
+    checkpoint = load_checkpoint(checkpoint_path, label="architect", device=device)
     model_config = checkpoint["model_config"]
     stats = checkpoint["normalization_stats"]
     log(f"architect: build_unet START | kind={model_config.get('kind', 'unet')} | device={device}")
@@ -242,6 +242,7 @@ def predict_x0_from_model_output(scheduler: Any, x_t: torch.Tensor, model_output
 
 def build_validation_loader(config: dict[str, Any], stats: dict[str, Any], batch_size: int) -> DataLoader:
     dataset_dir = resolve_project_path(config, config["data"]["dataset_dir"])
+    log(f"indexing validation dataset: {dataset_dir}")
     records = build_dataset_index(dataset_dir)
     filtered = filter_records(
         records,
@@ -249,18 +250,80 @@ def build_validation_loader(config: dict[str, Any], stats: dict[str, Any], batch
         min_mf_mean=config["data"].get("min_mf_mean"),
     )
     _, val_records = split_records(filtered, val_ratio=float(config["data"]["val_ratio"]), seed=int(config["seed"]))
+    log(f"validation records: filtered={len(filtered)} | val={len(val_records)} | batch_size={batch_size}")
     dataset = ShellDataset(val_records, stats=stats, include_physics=True)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
+
+
+def tweedie_prediction_error_and_grad(
+    clean: LoadedModel,
+    architect: torch.nn.Module,
+    architect_scheduler: Any,
+    architect_stats: dict[str, Any],
+    x_t: torch.Tensor,
+    fz_real: torch.Tensor,
+    physics_real_target: torch.Tensor,
+    mf_true: torch.Tensor,
+    timesteps: torch.Tensor,
+    eval_stats: dict[str, Any],
+) -> tuple[float, float, float]:
+    """Standard DPS-style baseline: Tweedie-denoise x_t through the
+    Architect, then evaluate the clean surrogate on the resulting
+    x0_hat at t=0. The gradient w.r.t. x_t is taken end-to-end through
+    the analytical Tweedie identity (the Architect output is detached,
+    matching the standard practical implementation of DPS)."""
+    x_req = x_t.detach().clone().requires_grad_(True)
+    with torch.no_grad():
+        arch_out = architect(x_req, timesteps).sample
+    x0_hat = predict_x0_from_model_output(architect_scheduler, x_req, arch_out, timesteps)
+    t_zero = torch.zeros_like(timesteps)
+    pred_norm = model_prediction(clean, x0_hat, fz_real, t_zero, eval_stats)
+    p_mean, p_std = expand_physics_stats(clean.stats, pred_norm.shape[0], pred_norm.device)
+    pred_real = pred_norm * p_std + p_mean
+    mf_pred, objective = mf_and_objective(clean, pred_norm)
+    grad = torch.autograd.grad(objective, x_req, retain_graph=False, create_graph=False)[0]
+
+    physics_mse = F.mse_loss(pred_real, physics_real_target).item()
+    mf_mae = torch.abs(mf_pred - mf_true).mean().item()
+    grad_norm = grad.flatten(1).norm(dim=1).mean().item()
+    return float(physics_mse), float(mf_mae), float(grad_norm)
 
 
 def evaluate_timestep_curves(
     engineer: LoadedModel,
     clean: LoadedModel,
+    architect: torch.nn.Module,
+    architect_scheduler: Any,
+    architect_stats: dict[str, Any],
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
     output_dir: Path,
 ) -> list[dict[str, float | int | str]]:
+    """Experiment 1. Empirical validation of Proposition 1 (Jensen's
+    Gap). Three variants are evaluated under identical noise samples:
+
+      * ``engineer_time``: the time-conditioned Engineer evaluated on
+        x_t with timestep t. Predicts E[R(x_0) | x_t] by construction
+        and should remain accurate across the full noise spectrum.
+      * ``clean_tweedie_x0``: the standard DPS baseline. The Architect
+        Tweedie-denoises x_t to x0_hat, on which the clean surrogate
+        is evaluated at t=0. It computes R(E[x_0 | x_t]), incurring
+        the Jensen's-Gap bias; expected to degrade smoothly as t
+        grows because Tweedie's posterior variance grows with t.
+      * ``clean_xt``: the most naive option. Feeds the noisy x_t
+        directly into a surrogate trained only on clean inputs at
+        t=0. Has no mathematical justification and is expected to
+        explode catastrophically with t.
+
+    For each variant we report the prediction error on the full
+    physics tensor (``physics_mse``), the per-pixel error on the
+    Membrane Factor map (``mf_mae``), and the norm of the data-space
+    gradient of the funicular objective with respect to x_t
+    (``grad_norm``). The latter is the quantity that is actually
+    injected into the reverse process during physics-guided sampling
+    and is therefore the most operationally meaningful diagnostic of
+    the Jensen's Gap."""
     t_max = int(engineer.scheduler.config.num_train_timesteps)
     timesteps = list(range(0, t_max, int(args.timestep_stride)))
     if timesteps[-1] != t_max - 1:
@@ -268,17 +331,20 @@ def evaluate_timestep_curves(
     log(
         "timestep evaluation config | "
         f"num_timesteps={len(timesteps)} | stride={args.timestep_stride} | "
-        f"batch_size={args.eval_batch_size} | max_batches={args.eval_max_batches}"
+        f"batch_size={args.eval_batch_size} | max_batches={args.eval_max_batches} | "
+        f"num_val_batches={len(loader)}"
     )
 
+    variant_names = ("engineer_time", "clean_tweedie_x0", "clean_xt")
     rows: list[dict[str, float | int | str]] = []
     generator = torch.Generator(device=device)
     generator.manual_seed(int(args.seed))
 
     for t_value in tqdm(timesteps, desc="E_DANI eval timesteps"):
+        log(f"eval timestep START: t={t_value}")
         totals: dict[str, dict[str, float]] = {
-            "engineer_time": {"physics_mse": 0.0, "mf_mae": 0.0, "grad_norm": 0.0, "n": 0.0},
-            "clean_xt": {"physics_mse": 0.0, "mf_mae": 0.0, "grad_norm": 0.0, "n": 0.0},
+            name: {"physics_mse": 0.0, "mf_mae": 0.0, "grad_norm": 0.0, "n": 0.0}
+            for name in variant_names
         }
         for batch_index, batch in enumerate(loader):
             if args.eval_max_batches is not None and batch_index >= int(args.eval_max_batches):
@@ -298,6 +364,18 @@ def evaluate_timestep_curves(
             metrics = {
                 "engineer_time": prediction_error_and_grad(
                     engineer, x_t, fz_real, physics_real, mf_true, t_batch, engineer.stats
+                ),
+                "clean_tweedie_x0": tweedie_prediction_error_and_grad(
+                    clean,
+                    architect,
+                    architect_scheduler,
+                    architect_stats,
+                    x_t,
+                    fz_real,
+                    physics_real,
+                    mf_true,
+                    t_batch,
+                    engineer.stats,
                 ),
                 "clean_xt": prediction_error_and_grad(
                     clean, x_t, fz_real, physics_real, mf_true, t_zero, engineer.stats
@@ -321,6 +399,7 @@ def evaluate_timestep_curves(
                     "grad_norm": values["grad_norm"] / n,
                 }
             )
+        log(f"eval timestep DONE: t={t_value}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "timestep_error_gradient.csv"
@@ -336,27 +415,46 @@ def evaluate_timestep_curves(
 
 def plot_error_gradient(rows: list[dict[str, float | int | str]], output_path: Path) -> None:
     labels = {
-        "engineer_time": "Engineer entrenado con t",
-        "clean_xt": "Clean sobre x_t ruidosa",
+        "engineer_time": "Time-conditioned Engineer (proposed)",
+        "clean_tweedie_x0": "Clean surrogate on Tweedie $\\hat{x}_0$ (DPS)",
+        "clean_xt": "Clean surrogate on $x_t$ (naive)",
     }
-    colors = {"engineer_time": "#0072B2", "clean_xt": "#D55E00"}
-    fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+    colors = {
+        "engineer_time": "#0072B2",
+        "clean_tweedie_x0": "#E69F00",
+        "clean_xt": "#D55E00",
+    }
+    markers = {
+        "engineer_time": "o",
+        "clean_tweedie_x0": "s",
+        "clean_xt": "^",
+    }
+    fig, axes = plt.subplots(3, 1, figsize=(9, 11), sharex=True)
     for variant, label in labels.items():
         subset = [row for row in rows if row["variant"] == variant]
+        if not subset:
+            continue
+        subset = sorted(subset, key=lambda row: row["timestep"])
         xs = np.asarray([row["timestep"] for row in subset], dtype=np.float64)
+        physics_mse = np.asarray([row["physics_mse"] for row in subset], dtype=np.float64)
         mf_mae = np.asarray([row["mf_mae"] for row in subset], dtype=np.float64)
         grad_norm = np.asarray([row["grad_norm"] for row in subset], dtype=np.float64)
-        axes[0].plot(xs, mf_mae, marker="o", linewidth=2.0, label=label, color=colors[variant])
-        axes[1].plot(xs, grad_norm, marker="o", linewidth=2.0, label=label, color=colors[variant])
+        axes[0].plot(xs, physics_mse, marker=markers[variant], linewidth=2.0, label=label, color=colors[variant])
+        axes[1].plot(xs, mf_mae, marker=markers[variant], linewidth=2.0, label=label, color=colors[variant])
+        axes[2].plot(xs, grad_norm, marker=markers[variant], linewidth=2.0, label=label, color=colors[variant])
 
-    axes[0].set_ylabel("MF MAE")
-    axes[0].set_title("Error vs timestep")
-    axes[1].set_ylabel("||d objective / d x_t||")
-    axes[1].set_xlabel("timestep t")
-    axes[1].set_title("Norma del gradiente vs timestep")
+    axes[0].set_ylabel("Physics tensor MSE")
+    axes[0].set_title("Surrogate accuracy across the diffusion noise spectrum")
+    axes[0].set_yscale("log")
+    axes[1].set_ylabel("Membrane Factor MAE")
+    axes[1].set_title("Per-pixel Membrane Factor error")
+    axes[2].set_ylabel(r"$\|\nabla_{x_t}\, J(x_t)\|_2$")
+    axes[2].set_xlabel("Diffusion timestep $t$")
+    axes[2].set_title("Norm of the guidance gradient injected into the reverse step")
+    axes[2].set_yscale("log")
     for axis in axes:
-        axis.grid(alpha=0.3)
-        axis.legend()
+        axis.grid(alpha=0.3, which="both")
+        axis.legend(frameon=False)
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
@@ -417,16 +515,27 @@ def guided_gradient(
 def run_guided_single_sample(
     engineer: LoadedModel,
     clean: LoadedModel,
-    architect_path: Path,
+    architect: torch.nn.Module,
+    architect_scheduler: Any,
+    arch_stats: dict[str, Any],
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
     output_dir: Path,
 ) -> dict[str, Any]:
-    architect, architect_scheduler, arch_stats = load_architect(
-        architect_path,
-        device=device,
-    )
+    """Experiment 2. End-to-end physics-guided sampling under three
+    gradient providers, all sharing the same Architect, the same bell
+    schedule, the same global scale and the same random seed, so that
+    any difference between the resulting trajectories is attributable
+    purely to the gradient quality:
+
+      * ``engineer_time`` (proposed) -- time-conditioned Engineer.
+      * ``clean_tweedie_x0`` (DPS baseline) -- clean surrogate on
+        Tweedie x0_hat at t=0; standard recipe in physics-guided
+        diffusion that incurs Jensen's-Gap bias.
+      * ``clean_xt`` (naive) -- clean surrogate fed directly with the
+        noisy x_t at t=0; included as the most pedagogical
+        illustration of the bias."""
     architect_scheduler.set_timesteps(int(args.sample_steps), device=device)
     log(
         "guided sampling config | "
@@ -503,16 +612,19 @@ def run_guided_single_sample(
 
 def plot_guided_samples(samples: dict[str, np.ndarray], output_path: Path) -> None:
     titles = {
-        "engineer_time": "Engineer con t",
-        "clean_xt": "Clean sobre x_t",
-        "clean_tweedie_x0": "Clean sobre Tweedie x0",
+        "engineer_time": "Time-conditioned Engineer (proposed)",
+        "clean_tweedie_x0": "Clean on Tweedie $\\hat{x}_0$ (DPS)",
+        "clean_xt": "Clean on $x_t$ (naive)",
     }
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    values = [array[0, 0] for array in samples.values()]
+    ordered_variants = [variant for variant in titles if variant in samples]
+    fig, axes = plt.subplots(1, len(ordered_variants), figsize=(4 * len(ordered_variants), 4))
+    if len(ordered_variants) == 1:
+        axes = [axes]
+    values = [samples[variant][0, 0] for variant in ordered_variants]
     vmin = min(float(value.min()) for value in values)
     vmax = max(float(value.max()) for value in values)
-    for axis, (variant, array) in zip(axes, samples.items(), strict=False):
-        axis.imshow(array[0, 0], cmap="viridis", vmin=vmin, vmax=vmax)
+    for axis, variant in zip(axes, ordered_variants, strict=False):
+        axis.imshow(samples[variant][0, 0], cmap="viridis", vmin=vmin, vmax=vmax)
         axis.set_title(titles[variant])
         axis.axis("off")
     fig.tight_layout()
@@ -522,24 +634,35 @@ def plot_guided_samples(samples: dict[str, np.ndarray], output_path: Path) -> No
 
 def plot_guided_histories(histories: dict[str, dict[str, list[float]]], output_path: Path) -> None:
     labels = {
-        "engineer_time": "Engineer con t",
-        "clean_xt": "Clean sobre x_t",
-        "clean_tweedie_x0": "Clean sobre Tweedie x0",
+        "engineer_time": "Time-conditioned Engineer (proposed)",
+        "clean_tweedie_x0": "Clean on Tweedie $\\hat{x}_0$ (DPS)",
+        "clean_xt": "Clean on $x_t$ (naive)",
+    }
+    colors = {
+        "engineer_time": "#0072B2",
+        "clean_tweedie_x0": "#E69F00",
+        "clean_xt": "#D55E00",
     }
     fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True)
     for variant, history in histories.items():
+        if variant not in labels:
+            continue
         t = np.asarray(history["t"], dtype=np.float64)
-        axes[0].plot(t, history["mf_mean"], label=labels[variant])
-        axes[1].plot(t, history["objective"], label=labels[variant])
-        axes[2].plot(t, history["grad_norm"], label=labels[variant])
-    axes[0].set_title("MF medio")
-    axes[1].set_title("Objetivo")
-    axes[2].set_title("Gradiente guiado")
+        axes[0].plot(t, history["mf_mean"], label=labels[variant], color=colors[variant], linewidth=2.0)
+        axes[1].plot(t, history["objective"], label=labels[variant], color=colors[variant], linewidth=2.0)
+        axes[2].plot(t, history["grad_norm"], label=labels[variant], color=colors[variant], linewidth=2.0)
+    axes[0].set_title("Mean Membrane Factor along the reverse process")
+    axes[0].set_ylabel(r"$\overline{\mathrm{mf}}_t$")
+    axes[1].set_title("Funicular objective")
+    axes[1].set_ylabel(r"$J_t = (1 - \overline{\mathrm{mf}}_t)^2$")
+    axes[2].set_title("Norm of the injected gradient")
+    axes[2].set_ylabel(r"$\|\widetilde{g}_t\|_2$")
+    axes[2].set_yscale("log")
     for axis in axes:
-        axis.set_xlabel("timestep t")
+        axis.set_xlabel("Diffusion timestep $t$")
         axis.invert_xaxis()
-        axis.grid(alpha=0.3)
-        axis.legend()
+        axis.grid(alpha=0.3, which="both")
+        axis.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -570,19 +693,35 @@ def main() -> None:
         clean_path,
         device,
     )
+    architect, architect_scheduler, arch_stats = load_architect(
+        architect_path,
+        device=device,
+    )
     log("validation loader START")
     loader = build_validation_loader(config, engineer.stats, int(args.eval_batch_size))
     log("validation loader DONE")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     log("timestep evaluation START")
-    evaluate_timestep_curves(engineer, clean, loader, args, device, output_dir)
+    evaluate_timestep_curves(
+        engineer=engineer,
+        clean=clean,
+        architect=architect,
+        architect_scheduler=architect_scheduler,
+        architect_stats=arch_stats,
+        loader=loader,
+        args=args,
+        device=device,
+        output_dir=output_dir,
+    )
     log("timestep evaluation DONE")
     log("guided single sample START")
     guide_summary = run_guided_single_sample(
         engineer=engineer,
         clean=clean,
-        architect_path=architect_path,
+        architect=architect,
+        architect_scheduler=architect_scheduler,
+        arch_stats=arch_stats,
         loader=loader,
         args=args,
         device=device,
